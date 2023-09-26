@@ -1,4 +1,4 @@
-use std::{env, path::Path};
+use std::{env, path::Path, thread};
 
 use gstreamer as gst;
 use gst::prelude::*;
@@ -8,6 +8,8 @@ use env_logger;
 
 fn main() {
     env_logger::init();
+
+    log::debug!("Started main process: {:?}", thread::current().id());
 
     let args = env::args().collect::<Vec<_>>();
     if args.len() != 2 {
@@ -35,12 +37,47 @@ fn main() {
         },
     };
 
-    let fakesink_el = match gst::ElementFactory::make("fakesink").name("sink").build() {
+    /*
+    let qtdemux_el = match gst::ElementFactory::make("qtdemux").name("src").build() {
+        Ok(el) => el,
+        Err(err) => {
+            panic!("Failed to make qtdemux element: {}", err);
+        },
+    };
+    */
+
+    let fakesink_el = match gst::ElementFactory::make("fakesink").name("sink").property("signal-handoffs", true).build() {
         Ok(el) => el,
         Err(err) => {
             panic!("Failed to make fakesink element: {}", err);
         },
     };
+    let handoff_signal_handler_id = fakesink_el.connect("handoff", false, |args| {
+        log::trace!("Started handling handoff signal: {:?}", thread::current().id());
+
+        let src_el = args[0].get::<gst::Element>().expect("handoff signal must supply src element");
+        assert_eq!(src_el.name(), "sink");
+
+        let buffer = args[1].get::<gst::Buffer>().expect("handoff signal must supply buffer");
+
+        /*
+        let map = match buffer.map_readable() {
+            Ok(map) => map,
+            Err(err) => {
+                panic!("Failed to map info: {}", err);
+            },
+        };
+        */
+
+        log::trace!("Received buffer: {:?}", buffer);
+
+        // filesrc
+        // BufferMap(Buffer { ptr: 0x7fc700f050c0, pts: --:--:--.---------, dts: 0:00:00.000000000, duration: --:--:--.---------, size: 4096, offset : 0, offset_end: 4096, flags: BufferFlags(DISCONT), metas: [] })
+
+        None
+    });
+    log::debug!("Set handoff signal handler: {:?}", handoff_signal_handler_id);
+
 
     if let Err(err) = pipeline.add_many(&[&filesrc_el, &fakesink_el]) {
         panic!("Failed to add elements to pipeline: {}", err);
@@ -61,7 +98,7 @@ fn main() {
 
     // set_state したら、次のステップで状態が変わる時もあれば変わらない時もある
     // あくまでも target となる state を set して、状態の遷移は非同期に行われることがある
-    // 以下のように複数の state がある
+    // 内部的には以下のように複数の state がある
     // - current_state
     // - pending_state
     // - next_state
@@ -84,20 +121,20 @@ fn main() {
     //
     // メモ: Clock, running_time, latency
     // は再生の時に、どこまで再生してどのフレームを描画してどのペースでレンダリングすればいいかを調整するために使われる。変換タスクでは使われない。たぶん。
+    //
+    // 上記の説明はあくまでも内部的な話で、 get_state では内部的な state を知ることはできないっぽい。
+    // message を通じて本当の内部 state を知ることができる
 
     assert_eq!(pipeline.state(None), (Ok(gst::StateChangeSuccess::Success), gst::State::Null, gst::State::VoidPending));
 
     match pipeline.set_state(gst::State::Playing) {
         Ok(gst::StateChangeSuccess::Success) => {
-            // 成功
-            assert_eq!(pipeline.state(None), (Ok(gst::StateChangeSuccess::Success), gst::State::Playing, gst::State::VoidPending));
+            // 成功 (
             log::debug!("Set pipeline playing immediately");
         },
         Ok(gst::StateChangeSuccess::Async) => {
             // 非同期処理で変更されるのでコールバックまち
-            // XXX ここにくるパターンを体験してない
-            // state がどのような状態になっているかを見て、何か assert でかけることがあったらここに書く
-            log::debug!("Started to set pipeline playing async: {:?}", pipeline.state(None));
+            log::debug!("Started to set pipeline playing async");
         },
         Ok(gst::StateChangeSuccess::NoPreroll) => {
             // ライブ配信などで、 Paused にしても続きから再生できないとき
@@ -131,33 +168,121 @@ fn main() {
     // これ自体が event loop なわけではなく、 msg queue を poll しているだけ
     for msg in bus.iter_timed(gst::ClockTime::NONE) {
         match msg.view() {
-            gstreamer::MessageView::Eos(eos) => {
-                // XXX I don't know if eos has usable info or not
-                log::debug!("Ended pipeline: {:?}", eos);
+            gst::MessageView::StateChanged(state_changed) => {
+                let el = state_changed.src()
+                    .expect("State changed message must be sent from element")
+                    .downcast_ref::<gst::Element>()
+                    .expect("State changed message must be sent from element");
+
+                let old_state = state_changed.old();
+                let current_state = state_changed.current();
+                let pending_state = state_changed.pending();
+
+                log::debug!("MESSAGE: State changed: [{}] {:?} -> {:?} {}", el.name(), old_state, current_state, if pending_state == gst::State::VoidPending { "".into() } else { format!("(final: {:?})", pending_state) });
+            },
+            gst::MessageView::StreamStatus(stream_status) => {
+                let pad = stream_status.src()
+                    .expect("Stream status message must be sent from pad")
+                    .downcast_ref::<gst::Pad>()
+                    .expect("Stream status message must be sent from pad");
+
+                let (status_type, owner_el) = stream_status.get();
+                assert_eq!(pad.parent_element().unwrap().name(), owner_el.name());
+
+                // 公式 doc 曰く
+                // gst::Task が入っているが、将来にわたってそういう保証はないとのこと
+                let task = stream_status.stream_status_object()
+                    .expect("Stream status object must be given")
+                    .get::<gst::Task>()
+                    .ok();
+
+                // stream に関連づけられた task の名前はそのストリームが最初に出てきた element_name:pad_name らしい。
+                // 例えば安直なコードだと filesrc0:src とかになる
+
+                // [el_name:pad_name] (task_state) stream_status
+                log::debug!("MESSAGE: Stream: [{}:{}] (task={}) {:?}", owner_el.name(), pad.name(), task.map(|task| format!("{:?}", task.state())).unwrap_or("Unknown".into()), status_type);
+            },
+            gst::MessageView::AsyncDone(async_done) => {
+                // AsyncDone メッセージは 全ての sink elements の preroll が済んだことを示している
+                // ちなみにこれと対をなす AsyncStart は pipeline まで upward されずに pipeline
+                // で消費される。なぜ、そうなっているのかはわからないけど、 gstbin.c の
+                // gst_bin_handle_message_func 関数のヘッダコメントにそう書かれてる
+                let pipeline = async_done.src()
+                    .expect("Async done message must be sent from pipeline")
+                    .downcast_ref::<gst::Pipeline>()
+                    .expect("Async done message must be sent from pipeline");
+                assert_eq!(pipeline.name(), "main_pipeline");
+
+                log::debug!("MESSAGE: Async (Preroll) done: [{}] {}", pipeline.name(), if let Some(time) = async_done.running_time() { time.to_string() } else { "".into() });
+            },
+            gst::MessageView::StreamStart(stream_start) => {
+                let pipeline = stream_start.src()
+                    .expect("Stream start message must be sent from pipeline")
+                    .downcast_ref::<gst::Pipeline>()
+                    .expect("Stream start message must be sent from pipeline");
+                assert_eq!(pipeline.name(), "main_pipeline");
+
+                // stream は group_id というものを持つ、 stream の group_id は以下のような振る舞いをする
+                // - demux, queue など元の stream を派生させたり透過させたりする場合、そのストリームは派生元の group_id を持つ
+                // - filesrc, audiotestsrc など一からストリームを作るような stream は group_id を新しく割り当てる
+                // - mux など複数のストリームから一つのストリームを作るような stream も group_id を新しく割り当てる
+                //
+                // この挙動によって、どのストリームの源泉から来たストリームなのかを確認することができる
+                let group_id = stream_start.group_id().expect("Stream start must have group_id");
+
+                log::debug!("MESSAGE: Stream started: [{}] {:?}", pipeline.name(), group_id);
+            },
+            gst::MessageView::Latency(latency) => {
+                let el = latency.src()
+                    .expect("Latency message must be sent from element")
+                    .downcast_ref::<gst::Element>()
+                    .expect("Latency message must be sent from element");
+
+                log::debug!("MESSAGE: Need recalculate latency: [{}]", el.name());
+                if let Err(err) = pipeline.recalculate_latency() {
+                    panic!("Failed to recalculate latency when receiving LATENCY message: {}", err);
+                };
+            },
+            gst::MessageView::NewClock(new_clock) => {
+                let pipeline = new_clock.src()
+                    .expect("New clock message must be sent from pipeline")
+                    .downcast_ref::<gst::Pipeline>()
+                    .expect("New clock message must be sent from pipeline");
+                assert_eq!(pipeline.name(), "main_pipeline");
+
+                let clock = new_clock.clock().expect("New clock message must have a new clock object");
+
+                log::debug!("MESSAGE: Clock set: [{}] {:?}", pipeline.name(), clock);
+            },
+            gst::MessageView::Eos(eos) => {
+                let pipeline = eos.src()
+                    .expect("EOS message must be sent from pipeline")
+                    .downcast_ref::<gst::Pipeline>()
+                    .expect("EOS message must be sent from pipeline");
+                assert_eq!(pipeline.name(), "main_pipeline");
+
+                log::debug!("MESSAGE: EOS: [{}]", pipeline.name());
                 break;
             },
-            gstreamer::MessageView::Error(err) => {
+            gst::MessageView::Error(err) => {
                 panic!("Error from {:?}: {} ({:?})", msg.src().map(|s| s.path_string()), err.error(), err.debug());
             }
             view => {
-                log::debug!("Unknown message: {:?}", view);
+                log::info!("MESSAGE: Unknown message: {:?}", view);
             },
         }
     }
 
     assert_eq!(pipeline.state(None), (Ok(gst::StateChangeSuccess::Success), gst::State::Playing, gst::State::VoidPending));
 
-    match pipeline.set_state(gstreamer::State::Null) {
+    match pipeline.set_state(gst::State::Null) {
         Ok(gst::StateChangeSuccess::Success) => {
             // 成功
-            assert_eq!(pipeline.state(None), (Ok(gst::StateChangeSuccess::Success), gst::State::Null, gst::State::VoidPending));
             log::debug!("Set pipeline null immediately");
         },
         Ok(gst::StateChangeSuccess::Async) => {
-            // 非同期処理で変更されるのでコールバックまち
-            // XXX ここにくるパターンを体験してない
-            // state がどのような状態になっているかを見て、何か assert でかけることがあったらここに書く
-            log::debug!("Started to set pipeline null async: {:?}", pipeline.state(None));
+            // 非同期処理で変更された場合
+            log::debug!("Started to set pipeline null async");
         },
         Ok(gst::StateChangeSuccess::NoPreroll) => {
             // XXX ここにくるパターンを体験してない
@@ -181,8 +306,10 @@ fn main() {
         },
     }
 
+    assert_eq!(pipeline.state(None), (Ok(gst::StateChangeSuccess::Success), gst::State::Null, gst::State::VoidPending));
+
     for msg in bus.iter() {
-        log::debug!("Remaining message after EOS: {:?}", msg.view());
+        log::debug!("MESSAGE: Remaining message after EOS: {:?}", msg.view());
     }
 }
 
