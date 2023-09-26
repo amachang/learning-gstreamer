@@ -37,14 +37,12 @@ fn main() {
         },
     };
 
-    /*
-    let qtdemux_el = match gst::ElementFactory::make("qtdemux").name("src").build() {
+    let qtdemux_el = match gst::ElementFactory::make("qtdemux").name("demux").build() {
         Ok(el) => el,
         Err(err) => {
             panic!("Failed to make qtdemux element: {}", err);
         },
     };
-    */
 
     let fakesink_el = match gst::ElementFactory::make("fakesink").name("sink").property("signal-handoffs", true).build() {
         Ok(el) => el,
@@ -52,6 +50,7 @@ fn main() {
             panic!("Failed to make fakesink element: {}", err);
         },
     };
+
     let handoff_signal_handler_id = fakesink_el.connect("handoff", false, |args| {
         log::trace!("Started handling handoff signal: {:?}", thread::current().id());
 
@@ -60,30 +59,78 @@ fn main() {
 
         let buffer = args[1].get::<gst::Buffer>().expect("handoff signal must supply buffer");
 
-        /*
         let map = match buffer.map_readable() {
             Ok(map) => map,
             Err(err) => {
                 panic!("Failed to map info: {}", err);
             },
         };
-        */
 
-        log::trace!("Received buffer: {:?}", buffer);
+        log::trace!("Received buffer: {:?} {:?}", buffer, map);
 
-        // filesrc
+        // filesrc output
         // BufferMap(Buffer { ptr: 0x7fc700f050c0, pts: --:--:--.---------, dts: 0:00:00.000000000, duration: --:--:--.---------, size: 4096, offset : 0, offset_end: 4096, flags: BufferFlags(DISCONT), metas: [] })
+        //
+        // qtdemux output
+        // BufferMap(Buffer { ptr: 0x7feaf8a41260, pts: 0:00:00.000000000, dts: 0:00:00.000000000, duration: 0:00:00.033366666, size: 900, offset: 18446744073709551615, offset_end: 18446744073709551615, flags: BufferFlags(DISCONT), metas: [] })
 
         None
     });
     log::debug!("Set handoff signal handler: {:?}", handoff_signal_handler_id);
 
+    let pipeline_clone = pipeline.clone();
+    let fakesink_el_clone = fakesink_el.clone();
+    qtdemux_el.connect_pad_added(move |el, pad| {
+        assert_eq!(el.name(), "demux");
 
-    if let Err(err) = pipeline.add_many(&[&filesrc_el, &fakesink_el]) {
+        let caps = pad.caps().expect("qtdemux pad must have caps");
+        assert_eq!(pad.direction(), gst::PadDirection::Src);
+
+        let fakesink_pad = fakesink_el_clone.static_pad("sink").expect("fakesink must have a sink pad");
+        if !fakesink_pad.is_linked() {
+            if caps.iter().any(|structure| structure.name().as_str() == "video/x-h264") {
+                if let Err(err) = pipeline_clone.add(&fakesink_el_clone) {
+                    panic!("Failed to add elements to pipeline: {}", err);
+                };
+                pad.link(&fakesink_pad).expect("No src pad failed to connect empty fakesink");
+                if let Err(err) = fakesink_el.sync_state_with_parent() {
+                    panic!("Failed to sync state with parent: {}", err);
+                };
+
+                // ignore other pad
+                log::debug!("Connected qtdemux first video pad to fakesink: {}", pad.name());
+                return;
+            }
+        };
+
+        // Otherwise
+
+        let ignoresink_el = match gst::ElementFactory::make("fakesink").build() {
+            Ok(el) => el,
+            Err(err) => {
+                panic!("Failed to make fakesink element: {}", err);
+            },
+        };
+        if let Err(err) = pipeline_clone.add(&ignoresink_el) {
+            panic!("Failed to add elements to pipeline: {}", err);
+        };
+        let ignoresink_pad = ignoresink_el.static_pad("sink").expect("fakesink must have a sink pad");
+        pad.link(&ignoresink_pad).expect("No src pad failed to connect empty fakesink");
+        if let Err(err) = ignoresink_el.sync_state_with_parent() {
+            panic!("Failed to sync state with parent: {}", err);
+        };
+
+        // ignore other pad
+        log::debug!("Ignore qtdemux pad: {}", pad.name());
+    });
+
+    if let Err(err) = pipeline.add_many(&[&filesrc_el, &qtdemux_el]) {
         panic!("Failed to add elements to pipeline: {}", err);
     };
 
-    if let Err(err) = gst::Element::link_many(&[&filesrc_el, &fakesink_el]) {
+    // qtdemux_el の src pad は presence が sometimes なので、この時点では存在しないので
+    // fakesink_el をつなげない　
+    if let Err(err) = gst::Element::link_many(&[&filesrc_el, &qtdemux_el]) {
         panic!("Failed to link elements: {}", err);
     };
 
@@ -159,7 +206,6 @@ fn main() {
             }
         },
     }
-
 
     let bus = pipeline.bus().expect("The bus must exist when the pipeline exists. I don't know when it happens");
 
