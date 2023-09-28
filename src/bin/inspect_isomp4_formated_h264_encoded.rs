@@ -3,6 +3,8 @@ use std::{env, path::Path, thread};
 use gstreamer as gst;
 use gst::prelude::*;
 
+use h264_reader::nal::RefNal;
+
 use log;
 use env_logger;
 
@@ -44,6 +46,13 @@ fn main() {
         },
     };
 
+    let h264parse_el = match gst::ElementFactory::make("h264parse").name("dec").build() {
+        Ok(el) => el,
+        Err(err) => {
+            panic!("Failed to make h264parse element: {}", err);
+        },
+    };
+
     let fakesink_el = match gst::ElementFactory::make("fakesink").name("sink").property("signal-handoffs", true).build() {
         Ok(el) => el,
         Err(err) => {
@@ -66,19 +75,16 @@ fn main() {
             },
         };
 
-        log::trace!("Received buffer: {:?} {:?}", buffer, map);
+        let nal = RefNal::new(map.as_slice(), &[], true);
 
-        // filesrc output
-        // BufferMap(Buffer { ptr: 0x7fc700f050c0, pts: --:--:--.---------, dts: 0:00:00.000000000, duration: --:--:--.---------, size: 4096, offset : 0, offset_end: 4096, flags: BufferFlags(DISCONT), metas: [] })
-        //
-        // qtdemux output
-        // BufferMap(Buffer { ptr: 0x7feaf8a41260, pts: 0:00:00.000000000, dts: 0:00:00.000000000, duration: 0:00:00.033366666, size: 900, offset: 18446744073709551615, offset_end: 18446744073709551615, flags: BufferFlags(DISCONT), metas: [] })
+        log::trace!("Nal = {:?}", nal);
 
         None
     });
     log::debug!("Set handoff signal handler: {:?}", handoff_signal_handler_id);
 
     let pipeline_clone = pipeline.clone();
+    let h264parse_el_clone = h264parse_el.clone();
     let fakesink_el_clone = fakesink_el.clone();
     qtdemux_el.connect_pad_added(move |el, pad| {
         assert_eq!(el.name(), "demux");
@@ -86,42 +92,39 @@ fn main() {
         let caps = pad.caps().expect("qtdemux pad must have caps");
         assert_eq!(pad.direction(), gst::PadDirection::Src);
 
+        /*
         let fakesink_pad = fakesink_el_clone.static_pad("sink").expect("fakesink must have a sink pad");
         if !fakesink_pad.is_linked() {
             if caps.iter().any(|structure| structure.name().as_str() == "video/x-h264") {
-                if let Err(err) = pipeline_clone.add(&fakesink_el_clone) {
-                    panic!("Failed to add elements to pipeline: {}", err);
-                };
-                pad.link(&fakesink_pad).expect("No src pad failed to connect empty fakesink");
-                if let Err(err) = fakesink_el.sync_state_with_parent() {
-                    panic!("Failed to sync state with parent: {}", err);
-                };
+                pipeline_clone.add(&fakesink_el_clone).expect("Failed to add elements to pipeline");
+                pad.link(&fakesink_pad).expect("video/x-h264 src pad must be able to link to fakesink");
+                fakesink_el.sync_state_with_parent().expect("connect-add-ed element must be able to be sync state");
+
+                log::debug!("Connected qtdemux first video pad to fakesink: {}", pad.name());
+                return;
+            }
+        }
+        */
+
+        let h264parse_pad = h264parse_el_clone.static_pad("sink").expect("h264parse must have a sink pad");
+        if !h264parse_pad.is_linked() {
+            if caps.iter().any(|structure| structure.name().as_str() == "video/x-h264") {
+                pipeline_clone.add(&h264parse_el_clone).expect("Failed to add elements to pipeline");
+                pad.link(&h264parse_pad).expect("video/x-h264 src pad must be able to link to h264parse");
+                h264parse_el.sync_state_with_parent().expect("connect-add-ed element must be able to be sync state");
+
+                pipeline_clone.add(&fakesink_el_clone).expect("Failed to add elements to pipeline");
+                h264parse_el_clone.link(&fakesink_el_clone).expect("No src pad failed to connect empty fakesink");
+                fakesink_el.sync_state_with_parent().expect("connect-add-ed element must be able to be sync state");
 
                 // ignore other pad
-                log::debug!("Connected qtdemux first video pad to fakesink: {}", pad.name());
+                log::debug!("Connected qtdemux first video pad to h264parse: {}", pad.name());
+
                 return;
             }
         };
 
-        // Otherwise
-
-        let ignoresink_el = match gst::ElementFactory::make("fakesink").build() {
-            Ok(el) => el,
-            Err(err) => {
-                panic!("Failed to make fakesink element: {}", err);
-            },
-        };
-        if let Err(err) = pipeline_clone.add(&ignoresink_el) {
-            panic!("Failed to add elements to pipeline: {}", err);
-        };
-        let ignoresink_pad = ignoresink_el.static_pad("sink").expect("fakesink must have a sink pad");
-        pad.link(&ignoresink_pad).expect("No src pad failed to connect empty fakesink");
-        if let Err(err) = ignoresink_el.sync_state_with_parent() {
-            panic!("Failed to sync state with parent: {}", err);
-        };
-
-        // ignore other pad
-        log::debug!("Ignore qtdemux pad: {}", pad.name());
+        log::debug!("Ignore qtdemux pad than the other: {}", pad.name());
     });
 
     if let Err(err) = pipeline.add_many(&[&filesrc_el, &qtdemux_el]) {
