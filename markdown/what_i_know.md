@@ -2,16 +2,76 @@
 - GStreamer のビルド環境の構築/デバッグビルドをやったので lldb でのデバッグや、ログの挿入などができるようになった。
 - コンセプト
   - Element が基本的な機能を担当、これをパイプみたいに繋いでいくことで、ファイルの中身が順次処理され
+    - NULL <-> READY <-> PAUSED <-> PLAYING の状態遷移を行う。一個飛ばしとかはない。 NULL から PLAYING に遷移する設定をしたらその中間の状態遷移も起こす
+      - NULL: エレメントのデフォルト状態。リソースがほとんど解放されてる状態
+      - READY: リソースの割り当てが行われてる状態。 running_time (メディアの再生位置の時間) は 0 にリセットされてる
+      - PAUSED: Clock が動いてない状態だけど running_time は 0 じゃない。
+      - PLAYING: Clock が動いている状態。
+    - Clock は全体で一つ、 running_time は Element により固有で差が出てくる。なので running_time を見ると Element ごとにどの位置を処理してるかわかる
   - Pad が Element と Element を接続する役割
+    - Pad には 3 つの生成方法がある
+      - Always Pad: Element に常に付属している Pad 例えば x265enc とかだったら sink に video/x-raw 、 src に video/x-h264 って決まってるのでそういう場合は Always Pad
+      - Sometimes Pad: Flow の途中で動的に生成される Pad。 demux とかした時に複数の stream が含まれているときにその分次々に video_0 subtitle_0 のように生成されていく 
+        - コードで書くときは Element pad-added Signal のコールバックで追加できる
+          - この Signal は GStreamer のコンセプトというよりは、 GLib 2.0 の EventEmitter のようなもの
+      - Request Pad: これは繋げる側がリクエストしたら勝手に生成してくれるような Pad
+        - 例えば tee とかは同じストリームを複製してくれるが。 src pad をリクエストされたらその分、複製したストリームが出てくる Pad を増やす
+        - また muxer も複数のストリームをファイルに書き込むので、 sink pad をリクエストされたらその分ストリームをファイルに作る
     - データが入る方が sink 出る方が src と呼ばれる。　
     - Pad は通過するデータの形式を caps という形式で制限する
       - この Pad 同士が繋がるかどうかネゴシエートすることを Caps Negotiation という
+      - Element は Pad を通じて Event や Buffer をやりとりする
+    - Caps の詳細
+      - Pad は複数の Structure というメディアタイプの詳細を持っている（mime type のような文字列と、細かな制約条件例えばフレームの大きさの制約とか）
+      - Pad ができる前に Pad Template というところに、 Caps が定義されている
+      - Pad ができると Pad Template の Caps が Pad の Caps にコピーされる
+      - Pad が繋がると Caps を通じて流れているデータの種類も知ることができる
+      - Caps の使われ方
+        - Autoplugging: 自動的にネゴシエーションして caps が合う Element を見つけて src と sink を繋げる
+        - Compatibility detection: 何に使う pad かを確認する。ネゴシエーションでもこれを使う
+        - Metadata: Caps を通じて、今流れているデータが持っているメタデータを読める（実際に繋がった相手が流してくるフレームのサイズとか）
+          - 結構重要
+        - Filtering: Autoplugging と似ているが複数の Element の集合から caps を使ってフィルタリングしたりできる
+  - Bin は Element の集合でもあり、それ自体も Element を継承したオブジェクト
+    - 複数の Element を合わせて Bin にする
+    - Pipeline も Bin だけど、トップレベルのためのもので全体の終了を把握したり、開始終了のコントロールをしたりなどの役割がある
+    - Bin は複数の Element の複合的な状態を管理したり、複数の Element に同時に指示を出したりするために使われたりもする
+  - Buffer は src から sink 方向へ Element から Element に流れていくデータ。 video/x-h264 の src から流れてきたデータだと GstBuffer に nal が入ってたりする
+  - Flow とは Buffer の流れのことを言い、これを制御するという文脈で時々出てくる
+  - Event は Flow を制御したりするためにも使える任意の情報を載せられる Element 間メッセージ。
+    - 同じ Event でも誰が誰に送ったかで意味も変わってくるので、そこら辺はさまざまな Element の仕様に詳しくなる必要がある
+      - 例えば filesrc の EOS Event はデータの読み取りの完了を意味するし、 filesink の EOS Event はファイルの書き込み終了を意味する
+        - 同じ EOS Event でも、それぞれでいろいろな意味を持ちうる
+    - Event を上流に送って pipeline を seek させる例が載ってる
+      - https://gstreamer.freedesktop.org/documentation/application-development/basics/data.html?gi-language=c
+    - Event のハンドリングは基本的に Element が書く責任があるが、 FLUSH_STOP FLUSH_START NAVIGATION QOS(品質情報) SEEK EOF などはデフォルトの挙動がある
+  - Message は Bus というものを通じて Application に送られてくる。 Application に送る Message は Event とは違う経路を持っている
+    - EOS Message や Error Message などをよく使う 
+  - Query は sink 側から呼ばれるときはアップストリームクエリと言われその使い方が多い。 Application からも使える
+    - 同期的に行われるので、回答がコールバックされるとかではなく。一連のコードの流れで行うことができる（その代わりブロックされたりするかも）
+- 注意
+  - Pipeline (または Bin) のなかで Element を使う時は add してから link する必要がある
+    - add の時に link が切れたりする
+    - 別々の Bin にある Element を繋ぐときは Bin の出口に Ghost Pad というのを使ってその Pad を経由して Proxy のように接続する必要がある
+      - 具体的には `gst_element_add_pad(bin, gst_ghost_pad_new("sink", pad))` って感じで Bin に sink という Bin の sink という出口を作り、そこに中のエレメントの sink をつなぐ感じ。
+
 
 # 知らないこと/やりたいこと
 - GStreamer のログを入れて、 GST\_DEBUG でフィルタリングできるようにするやり方
   - 調べればすぐわかりそうだし、前コードのどこかで読んだ。 WARN > DEBUG > LOG > TRACE みたいな感じだったけど、番号の対応を忘れた
   - 確か macro で定義されてた
 - Caps Negotiation について、繋がると思っていたけど繋がらなかったり、 pipeline を文字列で書くやつで複数の pad がある要素同士を繋いだらうまくいかない時もある。ここはちゃんと勉強しておかないといけない
+  - ここら辺は Plugin 開発ガイドを読むと一番詳しく書かれているらしい
+    - https://gstreamer.freedesktop.org/documentation/plugin-development/index.html
+- Event と Buffer の違い
+- Bin のログ見にくい問題
+    - Element を組み合わせた Bin だが、ログでは Bin ではなく Element 名が書かれがちなので、知らない Element が出てきて意味不明になりがち
+      - なので、結局 Bin の中身を把握しておく必要が出てきてしまう
+- Event が Flow に同期して、発生したり出せたりするみたいなコンセプトに書かれているけどどういうことなのかは不明
+  - まあ EOS とかが代表例なんだろうけど、 EOS ってあれは src を持たない Element が出しているものなのだろうか。出す義務はあるのだろうか。勝手に出るものなのだろうか。w
+- appsink は結局 EOS イベントを自分で出すべきなの？
+- ElementFactory は Element を作るための builder だが、 Element を作る前に Pad の Caps の前情報を持っているので、繋がることが分かってる Element を作ることができるらしいがやったことない
+- Clock は Pipeline に一つだけのものなので、 PAUSE と PLAYING の状態遷移は全ての Element で同時に起こるらしいので試す
 
 # へ〜ってこと（そんなに重要じゃないこと）
 - GLib 2.0 をベースに書かれている
