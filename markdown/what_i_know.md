@@ -72,6 +72,16 @@
 - appsink は結局 EOS イベントを自分で出すべきなの？
 - ElementFactory は Element を作るための builder だが、 Element を作る前に Pad の Caps の前情報を持っているので、繋がることが分かってる Element を作ることができるらしいがやったことない
 - Clock は Pipeline に一つだけのものなので、 PAUSE と PLAYING の状態遷移は全ての Element で同時に起こるらしいので試す
+- queue が詰まって動かなくなることがよくあるので、 overrun シグナルと underrun シグナルとか running シグナルをちゃんと見るようにしよう
+  - queue が詰まる挙動はここを読んだ方が良さそうこの Stackoverflow 神
+    - https://stackoverflow.com/questions/49398734/why-does-on-screen-video-fail-to-update-unless-i-have-two-queues
+    - https://gstreamer.freedesktop.org/documentation/additional/design/element-sink.html?gi-language=c
+- queue2 による buffering について詳しく書かれてる
+  - https://gstreamer.freedesktop.org/documentation/additional/design/buffering.html?gi-language=c#buffering
+  - preroll したい時に queue2 で use-buffering すると BUFFERING メッセージで何%とかの値を送って、一定バッファするまで再生しないとかするらしい
+  - Buffering Query を使うと buffering の状態を pull でとってこれるっぽい (stuck してる時に試してみるのもいいかも。多分 queue2 とか使ってないと関係ない)
+- Latency に関しても詳しくならないと困ることがありそう。 pipeline の進行に大きく関わっているように見えるので
+  - https://gstreamer.freedesktop.org/documentation/additional/design/latency.html?gi-language=c#latency
 
 # へ〜ってこと（そんなに重要じゃないこと）
 - GLib 2.0 をベースに書かれている
